@@ -1,6 +1,6 @@
 # =============================================================================
 # PROJECT: R-PAC FORENSIC AUDIT
-# REVISION: 53 (FIXED GENERATION HELPER + CANARY/MIA/EXPOSURE/DISTINGUISHABILITY)
+# REVISION: 54 (SIGMA SWEEP PRIVACY AUDITS)
 # =============================================================================
 
 name: "R-PAC FORENSIC AUDIT"
@@ -135,7 +135,6 @@ jobs:
               return f"CANARY_SECRET: ZXQ-ALPHA-{a}-BETA-{b}"
 
           def score_target_nll(model, tokenizer, user_prompt, target_text):
-              # Best-effort token-level NLL scorer.
               prompt = apply_chat(user_prompt)
               full = prompt + target_text
 
@@ -423,3 +422,83 @@ jobs:
           print("- Use it to compare runs / adapters, not as a proof of privacy.")
           EOF
           ./venv/bin/python3 residual_distinguishability_audit.py
+
+      - name: "Step 8: Sigma Privacy Sweep (REAL TEST)"
+        run: |
+          cat <<'EOF' > sigma_privacy_sweep.py
+          import mlx_lm
+          import mlx.core as mx
+          import numpy as np
+          import os, shutil, re
+          from audit_helpers import (
+              score_target_nll,
+              auc_from_scores,
+              best_attack_advantage,
+              rank_canary,
+              exposure_from_rank
+          )
+
+          MODEL_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
+
+          sigmas = np.linspace(0.0, 0.26, 10)
+
+          TRUE_CANARY = "CANARY_SECRET: ZXQ-ALPHA-314159-BETA-271828"
+          USER_PROMPT = "PATIENT RECORD: Name=Alice Example; MRN=314159; Dx=arrhythmia."
+
+          members = [
+              ("ENCOUNTER 0: Patient with arrhythmia.", "SECURITY_TAG: RAPID-0000-X"),
+              ("ENCOUNTER 1: Patient with arrhythmia.", "SECURITY_TAG: RAPID-1001-X"),
+          ]
+
+          nonmembers = [
+              ("ENCOUNTER 0: Patient with arrhythmia.", "SECURITY_TAG: RAPID-9999-X"),
+              ("ENCOUNTER 1: Patient with arrhythmia.", "SECURITY_TAG: RAPID-8888-X"),
+          ]
+
+          print("=" * 100)
+          print(f"{'SIGMA':<8} | {'EXPOSURE':<12} | {'MIA_AUC':<10} | {'ADV':<8}")
+          print("=" * 100)
+
+          base_weights = mx.load("base_dora/adapters.safetensors")
+
+          for s in sigmas:
+              prot = {
+                  k: (v + mx.array(np.random.normal(0, s, v.shape).astype(np.float32)))
+                  if (k.endswith('.m') and 'layers' in k and int(re.search(r'layers\.(\d+)\.', k).group(1)) >= 14)
+                  else v
+                  for k, v in base_weights.items()
+              }
+
+              tmp_path = f"tmp_sigma_{s:.2f}"
+              os.makedirs(tmp_path, exist_ok=True)
+              shutil.copy("base_dora/adapter_config.json", f"{tmp_path}/adapter_config.json")
+              mx.save_safetensors(f"{tmp_path}/adapters.safetensors", prot)
+
+              model, tokenizer = mlx_lm.load(MODEL_PATH, adapter_path=tmp_path)
+
+              rank, total, _ = rank_canary(
+                  model,
+                  tokenizer,
+                  USER_PROMPT,
+                  TRUE_CANARY,
+                  num_random=128,
+                  seed=42
+              )
+              exposure = exposure_from_rank(rank, total)
+
+              member_scores = [score_target_nll(model, tokenizer, p, t) for p, t in members]
+              nonmember_scores = [score_target_nll(model, tokenizer, p, t) for p, t in nonmembers]
+
+              auc = auc_from_scores(member_scores, nonmember_scores)
+              adv = best_attack_advantage(member_scores, nonmember_scores)["adv"]
+
+              print(f"{s:<8.2f} | {exposure:<12.6f} | {auc:<10.4f} | {adv:<8.4f}")
+
+          print("=" * 100)
+          print("Interpretation:")
+          print("- Exposure down means less memorization.")
+          print("- MIA AUC down means less membership signal.")
+          print("- Attack advantage down means harder member/non-member separation.")
+          print("- If these all drop before utility collapses, perturbation is actually helping.")
+          EOF
+          ./venv/bin/python3 sigma_privacy_sweep.py
